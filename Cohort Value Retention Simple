@@ -1,0 +1,134 @@
+WITH UserCohorts AS (
+    SELECT
+        CLIENT_IDENTIFIER AS USER,
+        FORMAT_DATE('%Y%m', MIN(DATE)) AS Cohort_Month
+    FROM `meradata-prd.finance.obt_finance__br_net_revenue`
+    WHERE merchant_api = 'BRGTH'
+        AND transaction_nature = 'Venda'
+        AND CNPJ_EMIT IN ('10832644000108', '10832644000280', '10832644000361')
+        AND INVOICE_STATUS = 'Autorizado o uso da NF-e'
+    GROUP BY CLIENT_IDENTIFIER
+),
+
+CohortRevenue AS (
+    SELECT
+        uc.Cohort_Month AS Entry_Cohort,
+        FORMAT_DATE('%Y%m', r.DATE) AS Purchase_Cohort,
+        SUM(r.VTOTALPROD) AS Total_Revenue
+    FROM UserCohorts uc
+    JOIN `meradata-prd.finance.obt_finance__br_net_revenue` r ON uc.USER = r.CLIENT_IDENTIFIER
+    WHERE merchant_api = 'BRGTH'
+        AND transaction_nature = 'Venda'
+        AND CNPJ_EMIT IN ('10832644000108', '10832644000280', '10832644000361')
+        AND INVOICE_STATUS = 'Autorizado o uso da NF-e'
+    GROUP BY Entry_Cohort, Purchase_Cohort
+),
+
+CohortAge0Revenue AS (
+    SELECT 
+        Entry_Cohort,
+        Total_Revenue AS Age0_Revenue
+    FROM CohortRevenue
+    WHERE Entry_Cohort = Purchase_Cohort
+),
+
+NormalizedCohortRevenue AS (
+    SELECT
+        cr.Entry_Cohort,
+        cr.Purchase_Cohort,
+        DATE_DIFF(PARSE_DATE('%Y%m', cr.Purchase_Cohort), PARSE_DATE('%Y%m', cr.Entry_Cohort), MONTH) AS Cohort_Age,
+        SAFE_DIVIDE(cr.Total_Revenue, c0.Age0_Revenue) AS Revenue_Retention
+    FROM CohortRevenue cr
+    JOIN CohortAge0Revenue c0 ON cr.Entry_Cohort = c0.Entry_Cohort
+),
+
+data as (
+SELECT  
+Entry_Cohort as cohort,
+Cohort_Age as age,
+Revenue_Retention as revenue
+
+FROM NormalizedCohortRevenue),
+
+-- Applying the algorithm
+first_data AS (
+    SELECT age as first_age, revenue as first_revenue
+    FROM data 
+    ORDER BY age, revenue
+    LIMIT 1
+),
+
+aux_sk AS (
+    SELECT age, revenue, 
+        CASE 
+            WHEN ROW_NUMBER() OVER(ORDER BY age, revenue) = 1 THEN 0 
+            ELSE 1/2*(revenue + LAG(revenue) OVER(ORDER BY age, revenue))*(age - LAG(age) OVER(ORDER BY age, revenue)) 
+        END as first_part
+    FROM data
+),
+
+sks AS (
+    SELECT 
+        a.age, 
+        a.revenue, 
+        SUM(first_part) OVER(ORDER BY a.age, a.revenue) as sk, 
+        first_age, 
+        first_revenue
+    FROM aux_sk a, first_data f
+),
+
+aux_calcs as (
+    SELECT 
+        SUM((age - first_age)*(age - first_age)) as delta_age_squared, 
+        SUM((age - first_age)*sk) as delta_age_sk, 
+        SUM(sk*sk) as sk_squared,
+        SUM((revenue - first_revenue)*(age - first_age)) as delta_revenue_delta_age,
+        SUM((revenue - first_revenue)*sk) as delta_revenue_sk,
+        1/(SUM((age - first_age)*(age - first_age))*SUM(sk*sk) - SUM((age - first_age)*sk)*SUM((age - first_age)*sk)) as determinant
+    FROM sks
+),
+
+aux_theta AS (
+    SELECT 
+        determinant * (sk_squared*delta_revenue_delta_age - delta_age_sk*delta_revenue_sk) as A1,
+        determinant * (delta_age_squared*delta_revenue_sk - delta_age_sk*delta_revenue_delta_age) as c2
+    FROM aux_calcs
+),
+
+aux_theta_k AS (
+    SELECT EXP(c2*age) as theta, revenue, A1, c2
+    FROM data, aux_theta
+),
+
+theta_data AS (
+    SELECT 
+        SUM(theta) as sum_theta, 
+        SUM(theta*theta) as sum_squared_theta, 
+        SUM(revenue) as sum_revenue,
+        AVG(revenue) as avg_revenue,
+        SUM(revenue*theta) as theta_revenue, 
+        COUNT(*) as n, 
+        AVG(c2) as c2
+    FROM aux_theta_k
+),
+
+coefficients AS (
+    SELECT 
+        (1/(n*sum_squared_theta - sum_theta*sum_theta))*(sum_squared_theta*sum_revenue - sum_theta*theta_revenue) as a2, 
+        (1/(n*sum_squared_theta - sum_theta*sum_theta))*(-sum_theta*sum_revenue + n*theta_revenue) as b2,
+        c2,
+        avg_revenue
+    FROM theta_data
+),
+-- Finished applying algorithm to data
+
+-- Calculating R-squared
+analysis AS (
+    SELECT 
+        1 - SUM((revenue - (a2 + b2*EXP(c2*age)))*(revenue - (a2 + b2*EXP(c2*age))))/SUM((revenue-avg_revenue)*(revenue-avg_revenue)) as r_squared
+    FROM data, coefficients
+)
+
+-- Display results
+SELECT a2, b2, c2, CONCAT(a2, ' + ', b2, '*exp(', c2, '*age)') as curve, r_squared
+FROM coefficients, analysis
